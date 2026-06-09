@@ -237,6 +237,25 @@ body {
 .log-area .log-err  { color: #ef5350; }
 .log-area .log-warn { color: #ffa726; }
 
+/* ===== 6. 任务下达 ===== */
+.task-form { background:#0a141c; border-radius:6px; padding:10px; }
+.task-row { display:flex; gap:8px; flex-wrap:wrap; align-items:flex-end; }
+.task-field { display:flex; flex-direction:column; gap:3px; min-width:80px; }
+.task-field label { font-size:11px; color:#8bbccc; font-weight:600; }
+.task-field select, .task-field input {
+    background:#1a2d38; border:1px solid #1e3a4d; border-radius:4px;
+    padding:6px 8px; color:#cdd6e0; font-size:12px; outline:none;
+}
+.task-field select:focus, .task-field input:focus { border-color:#4fc3f7; }
+.task-btn-field { min-width:100px; }
+.btn-send {
+    background:#0d47a1; color:#fff; padding:8px 18px; border:none;
+    border-radius:6px; font-size:13px; font-weight:700; cursor:pointer;
+    transition:all 0.2s; letter-spacing:1px;
+}
+.btn-send:hover { background:#1565c0; box-shadow:0 0 10px #42a5f5; }
+.task-hint { margin-top:6px; font-size:11px; color:#6a8fa0; }
+
 /* responsive */
 @media (max-width: 800px) {
     .grid { grid-template-columns: 1fr; }
@@ -284,7 +303,60 @@ body {
             <div class="floor-content" id="floorContent">
                 <div style="color:#546e7a;font-size:12px;">加载中...</div>
             </div>
+    </div>
+
+    <!-- ========== 板块6: 任务下达 ========== -->
+    <div class="card full-width">
+        <div class="card-title">📋 手动任务下达</div>
+        <div class="task-form">
+            <div class="task-row">
+                <div class="task-field">
+                    <label>AGV编号</label>
+                    <select id="taskAgv">
+                        <option value="0">Agv-0</option>
+                        <option value="1">Agv-1</option>
+                        <option value="2">Agv-2</option>
+                        <option value="3">Agv-3</option>
+                        <option value="4">Agv-4</option>
+                        <option value="5">Agv-5</option>
+                        <option value="6">Agv-6</option>
+                        <option value="7">Agv-7</option>
+                        <option value="8">Agv-8</option>
+                    </select>
+                    </select>
+                </div>
+                <div class="task-field">
+                    <label>任务类型</label>
+                    <select id="taskType">
+                        <option value="搬运任务">🚚 搬运任务</option>
+                        <option value="缺省">🏃 空跑</option>
+                    </select>
+                </div>
+                <div class="task-field">
+                    <label>起点站</label>
+                    <input type="text" id="taskSrc" value="300" placeholder="地标号">
+                </div>
+                <div class="task-field">
+                    <label>终点站</label>
+                    <input type="text" id="taskTgt" value="307" placeholder="地标号">
+                </div>
+                <div class="task-field">
+                    <label>取货数量</label>
+                    <input type="number" id="taskQty" value="3" min="1" max="5">
+                </div>
+                <div class="task-field task-btn-field">
+                    <label>&nbsp;</label>
+                    <button class="btn-send" onclick="sendTask()">▶ 下达任务</button>
+                </div>
+            </div>
+            <div class="task-hint">
+                💡 <b>搬运任务</b>：AGV到起点站取货(≤数量)→送到终点站卸货，需在<b>手动模式</b>下执行。<br>
+                💡 <b>空跑</b>：AGV直接导航到终点站，不涉及货物，自动模式也可执行。
+            </div>
         </div>
+    </div>
+
+</div>
     </div>
 
     <!-- ========== 板块4: 电梯状态 ========== -->
@@ -386,6 +458,18 @@ function renderElevator(elev) {
     c.innerHTML = b('🄻 左电梯',elev.left||[],'left') + b('🅁 右电梯',elev.right||[],'right');
 }
 
+// ★ 手动任务下达
+async function sendTask() {
+    const agv = document.getElementById('taskAgv').value;
+    const type = document.getElementById('taskType').value;
+    const src = document.getElementById('taskSrc').value.trim();
+    const tgt = document.getElementById('taskTgt').value.trim();
+    const qty = parseInt(document.getElementById('taskQty').value) || 1;
+    if (!src || !tgt) { addLog('请填写起点站和终点站', 'log-err'); return; }
+    const cmd = 'manual-task ' + agv + ' ' + encodeURIComponent(type) + ' ' + src + ' ' + tgt + ' ' + qty;
+    await sendCmd(cmd);
+}
+
 // ★ 唯一数据入口：只调用 /dashboard，一次获取全部状态 ★
 async function refreshAll() {
     try {
@@ -413,9 +497,9 @@ async function refreshAll() {
 }
 
 updateModeUI();
-setInterval(refreshAll, 3000);
+setInterval(refreshAll, 1000);
 refreshAll();
 </script>
 </body>
 </html>
-  
+              

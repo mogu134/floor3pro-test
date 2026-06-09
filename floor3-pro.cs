@@ -103,6 +103,7 @@ namespace ProfControl
         private string _manualTgtStation = "";
         private string _manualMissionType = "";
         private string _manualElevatorSide = "";
+        private int _manualTakeQty = 5;       // 手动搬运任务数量限制(1-5)
         private ManualTaskState _manualTaskState = ManualTaskState.Idle;
         public void Main()
         {
@@ -327,12 +328,34 @@ namespace ProfControl
                         }
                     });
                     
+                    // ========== 手动任务下发端点（支持搬运任务+空跑） ==========
+                    app.MapGet("/manual-task", async ctx =>
+                    {
+                        try
+                        {
+                            string agvIdx = ctx.Request.Query["agv"];
+                            string taskType = System.Net.WebUtility.UrlDecode(ctx.Request.Query["type"].ToString());
+                            string srcStation = ctx.Request.Query["src"];
+                            string tgtStation = ctx.Request.Query["tgt"];
+                            string qtyStr = ctx.Request.Query["qty"];
+
+                            string cmd = $"manual-task {agvIdx} {taskType} {srcStation} {tgtStation} {qtyStr}";
+                            _manualCmdQueue.Enqueue(cmd);
+                            await ctx.Response.WriteAsync("OK");
+                        }
+                        catch (Exception ex)
+                        {
+                            await ctx.Response.WriteAsync($"ERROR: {ex.Message}");
+                        }
+                    });
+
                 });  // close API.Http
                 
                 Tools.trace("[手动模式] HTTP端点已注册:");
                 Tools.trace("  控制面板: http://localhost:58080/");
                 Tools.trace("  命令API:  http://localhost:58080/manual-cmd?cmd=...");
                 Tools.trace("  仪表盘API: http://localhost:58080/dashboard");
+                Tools.trace("  任务API:  http://localhost:58080/manual-task?agv=0&type=搬运任务&src=300&tgt=307&qty=3");
             }
             catch (Exception ex)
             {
@@ -1387,8 +1410,86 @@ namespace ProfControl
                 return;
             }
 
-            // 在手动模式下处理任务命令: [agv编号] [目标站] [left/right]
-            if (_manualMode)
+            // ========== 结构化任务命令解析（支持搬运任务和空跑） ==========
+            if (cmd.StartsWith("manual-task "))
+            {
+                var parts = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                if (parts.Length >= 6)
+                {
+                    string agvIdx = parts[1];
+                    string taskType = System.Net.WebUtility.UrlDecode(parts[2]);
+                    string srcStation = parts[3];
+                    string tgtStation = parts[4];
+                    int qty = int.TryParse(parts[5], out int q) ? Math.Clamp(q, 1, 5) : 5;
+
+                    string agvName = $"Agv-{agvIdx}";
+                    if (!_agvNames.Contains(agvName))
+                    {
+                        Tools.trace($"[手动任务] 错误: AGV {agvName} 不存在");
+                        return;
+                    }
+                    if (!_manualMode && taskType == "搬运任务")
+                    {
+                        Tools.trace($"[手动任务] 错误: 搬运任务需要在手动模式下执行");
+                        return;
+                    }
+
+                    if (taskType == "缺省")
+                    {
+                        // ★ 空跑：直接导航到目标点，不涉及货物
+                        var agv = API.GetAgv(agvName);
+                        if (agv != null)
+                        {
+                            if (agv.API.On != tgtStation)
+                                agv.API.GoTo(tgtStation, null);
+                            _agvStatus[agvName] = $"手动空跑→{tgtStation}";
+                            Tools.trace($"[手动任务] {agvName} 空跑前往站{tgtStation}");
+                        }
+                        return;
+                    }
+                    else if (taskType == "搬运任务")
+                    {
+                        // ★ 搬运任务：去src取货(最多qty个)→送到tgt
+                        string missionType = DetermineManualMissionType(int.Parse(tgtStation));
+                        if (string.IsNullOrEmpty(missionType))
+                        {
+                            Tools.trace($"[手动任务] 错误: 站{tgtStation}不是有效的卸货目标站");
+                            return;
+                        }
+                        if (_agvStatus[agvName] != "手动空闲")
+                        {
+                            Tools.trace($"[手动任务] 错误: {agvName} 状态为'{_agvStatus[agvName]}'，非空闲");
+                            return;
+                        }
+                        // 设置手动搬运任务
+                        _manualAgvName = agvName;
+                        _manualSrcStation = srcStation;
+                        _manualTgtStation = tgtStation;
+                        _manualMissionType = missionType;
+                        _manualTaskState = ManualTaskState.GoingToSource;
+                        _manualTakeQty = qty;
+
+                        _agvStatus[agvName] = "手动前往取货";
+                        _agvCurrentSource[agvName] = srcStation;
+                        _agvMissionType[agvName] = missionType;
+
+                        Tools.trace($"[手动任务] {agvName} 搬运{srcStation}→{tgtStation}({missionType}), 数量≤{qty}");
+                        return;
+                    }
+                    else
+                    {
+                        Tools.trace($"[手动任务] 错误: 未知任务类型'{taskType}'，应为'搬运任务'或'缺省'");
+                        return;
+                    }
+                }
+                else
+                {
+                    Tools.trace($"[手动任务] 错误: 参数不足，格式: manual-task agvIdx type src tgt qty");
+                    return;
+                }
+            }
+
+                // 在手动模式下处理任务命令: [agv编号] [目标站] [left/right]
             {
                 var parts = cmd.Split(' ', StringSplitOptions.RemoveEmptyEntries);
                 if (parts.Length >= 2)
@@ -1494,26 +1595,36 @@ namespace ProfControl
             var srcSta = API.GetStation(_manualSrcStation);
             if (srcSta == null) { ResetManualTask(); return; }
 
+            // ★ 根据源站类型决定取货区域和货物名称，而非根据任务类型！
+            int srcMark = int.Parse(_manualSrcStation);
             string areaName;
             string[] cargoNames;
 
-            if (_manualMissionType == "粗加工")
+            if (_sourceStations.Contains(srcMark))
             {
                 areaName = "输入机器";
-                cargoNames = _allSourceCargos;
+                cargoNames = _allSourceCargos;       // 货物1-4
             }
-            else
+            else if (_roughProcessStations.Contains(srcMark))
             {
                 areaName = "加工机器右区";
-                if (_manualMissionType == "精加工") cargoNames = _allRoughCargos;
-                else if (_manualMissionType == "组装") cargoNames = _allFineCargos;
-                else cargoNames = _allProductCargos; // 输出
+                cargoNames = _allRoughCargos;        // 货物5-8
+            }
+            else if (_fineProcessStations.Contains(srcMark))
+            {
+                areaName = "加工机器右区";
+                cargoNames = _allFineCargos;         // 货物9-12
+            }
+            else // 组装站（成品13/14）
+            {
+                areaName = "加工机器右区";
+                cargoNames = _allProductCargos;      // 成品13/14
             }
 
             var srcArea = srcSta.CargoAreas.FirstOrDefault(a => a.Name == areaName);
             if (srcArea == null || !srcArea.CargoChildren.Any())
             {
-                Tools.trace($"[手动模式] 源站{_manualSrcStation}没有可取的货物，任务取消");
+                Tools.trace($"[手动模式] 源站{_manualSrcStation}({areaName})没有可取的货物，任务取消");
                 ResetManualTask();
                 return;
             }
@@ -1527,29 +1638,30 @@ namespace ProfControl
                 return;
             }
 
-            // 取货：每种货物尽量取
+            // 取货：每种货物尽量取，但不超过_manualTakeQty个
             int taken = 0;
+            int remainingQty = _manualTakeQty;
             foreach (var cn in cargoNames)
             {
                 int qty = (int)(srcArea.Contains(cn)?.Quanlity ?? 0);
-                int take = Math.Min(qty, availableSlots - taken);
+                int take = Math.Min(qty, Math.Min(availableSlots - taken, remainingQty));
                 if (take > 0)
                 {
                     srcSta.CargoTake(areaName, cn, take);
                     agv.CargoPlace("agv缓冲区", cn, take);
                     taken += take;
+                    remainingQty -= take;
                 }
-                if (taken >= availableSlots) break;
+                if (taken >= availableSlots || remainingQty <= 0) break;
             }
 
-            Tools.trace($"[手动模式] {_manualAgvName} 从站{_manualSrcStation}取了{taken}件货物");
+            Tools.trace($"[手动模式] {_manualAgvName} 从站{_manualSrcStation}({areaName})取了{taken}件货物(上限{_manualTakeQty})");
 
             // 切换到前往目标站
             _agvStatus[_manualAgvName] = "手动前往卸货";
             _agvCurrentProc[_manualAgvName] = _manualTgtStation;
             _manualTaskState = ManualTaskState.GoingToTarget;
         }
-
         /// <summary>
         /// 手动卸货：从AGV缓冲区卸货到目标站
         /// </summary>
@@ -1737,4 +1849,4 @@ namespace ProfControl
         }
     }
 }
-                                                                                                              
+                                                                                                                                   
