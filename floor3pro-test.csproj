@@ -42,13 +42,19 @@
       <HintPath>C:\Program Files\dotnet\shared\Microsoft.NETCore.App\6.0.36\netstandard.dll</HintPath>
     </Reference>
     <Reference Include="Newtonsoft.Json">
-      <HintPath>C:\Users\GMK\Desktop\LWJ\ProfControlV8Update\Newtonsoft.Json.dll</HintPath>
+      <HintPath>C:\Users\GMK\Desktop\LWJ\www\ProfControlV8Update\Newtonsoft.Json.dll</HintPath>
     </Reference>
     <Reference Include="PresentationCore">
       <HintPath>C:\Program Files\dotnet\shared\Microsoft.WindowsDesktop.App\6.0.36\PresentationCore.dll</HintPath>
     </Reference>
     <Reference Include="System.Collections">
       <HintPath>C:\Program Files\dotnet\shared\Microsoft.NETCore.App\6.0.36\System.Collections.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Collections.Concurrent">
+      <HintPath>C:\Program Files\dotnet\shared\Microsoft.NETCore.App\6.0.36\System.Collections.Concurrent.dll</HintPath>
+    </Reference>
+    <Reference Include="System.Collections.Specialized">
+      <HintPath>C:\Program Files\dotnet\shared\Microsoft.NETCore.App\6.0.36\System.Collections.Specialized.dll</HintPath>
     </Reference>
     <Reference Include="System.Linq">
       <HintPath>C:\Program Files\dotnet\shared\Microsoft.NETCore.App\6.0.36\System.Linq.dll</HintPath>
@@ -79,6 +85,6 @@
     </Reference>
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="C:\Users\GMK\Desktop\LWJ\www\ProfControlV8Update\script\floor3pro-test\floor3-pro.cs" />
+    <Compile Include="C:\Users\GMK\Desktop\LWJ\www\ProfControlV8Update\script\floor3pro-test\floor3pro.cs" />
   </ItemGroup>
 </Project>
