@@ -8,7 +8,6 @@ using ProfControl.Model;
 using ProfControl.Model.Interface;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
-
 using System.Text;
 using System.IO;
 using System.Windows;
@@ -59,9 +58,15 @@ namespace ProfControl
         private static readonly Dictionary<string, string> _roughTransform = new Dictionary<string, string> { {"货物1", "货物5"}, {"货物2", "货物6"}, {"货物3", "货物7"}, {"货物4", "货物8"} };
         private static readonly Dictionary<string, string> _fineTransform = new Dictionary<string, string> { {"货物5", "货物9"}, {"货物6", "货物10"}, {"货物7", "货物11"}, {"货物8", "货物12"} };
 
-        // 3. 物理引擎参数与状态
-        private double _lambdaArrival = 0.05, _lambdaArrival4 = 0.05;
-        private double _lambdaRoughProcess = 0.01, _lambdaFineProcess = 0.005, _lambdaAssembly = 0.005;
+        // 3. 物理引擎参数与状态，加快10倍
+//        private double _lambdaArrival = 0.05, _lambdaArrival4 = 0.05;
+//        private double _lambdaRoughProcess = 0.01, _lambdaFineProcess = 0.005, _lambdaAssembly = 0.005;
+        private double _lambdaArrival = 0.5, _lambdaArrival4 = 0.5;
+        private double _lambdaRoughProcess = 0.1, _lambdaFineProcess = 0.05, _lambdaAssembly = 0.05;
+        
+        // ★ 全局仿真物理倍速
+        private int _simSpeed = 8; 
+        
         private Random _rand = new Random();
         private Dictionary<int, double> _arrivalTimers = new Dictionary<int, double>();
         private Dictionary<int, double> _processTimers = new Dictionary<int, double>();
@@ -144,11 +149,7 @@ namespace ProfControl
                             }
 
                             // 2. 阻塞等待 1 秒，让物理世界演进 (RL中的 1 Step)
-                            // 改为8倍速
-                            int simSpeed = 8; 
-
-                            // 如果是 8 倍速，现实中只需要等待 1000/8 = 125 毫秒，仿真世界就已经度过了 1 秒
-                            await Task.Delay(1000 / simSpeed);
+                            await Task.Delay(1000 / _simSpeed);
 
                             // 3. 组装环境最新状态返回
                             var response = new
@@ -239,11 +240,11 @@ namespace ProfControl
                                 {
                                 	agv.TaskKillAll();                               // 终止所有任务
                                     agv.TakeAll();                                   // 拿走所有货物
-                                    agv.View.Radian = Math.PI;                      // 调整朝向
-                                    agv.View.Move(parkingSta.View.KeyPoint, true);// 移动到停车站点
-                                    agv.View.ChangeToNetwork(parkingSta.Network); // 切换到目标楼层的网络，防止不在同一楼层
+                                    agv.View.Radian = Math.PI;                       // 调整朝向
+                                    agv.View.Move(parkingSta.View.KeyPoint, true);   // 移动到停车站点
+                                    agv.View.ChangeToNetwork(parkingSta.Network);    // 切换到目标楼层的网络，防止不在同一楼层
                                     agv.View.CalcBound();                            // 重新计算边界
-                                    agv.View.SafeInvalidate();                      // 刷新显示
+                                    agv.View.SafeInvalidate();                       // 刷新显示
                                 }
                             });
                             
@@ -610,16 +611,18 @@ namespace ProfControl
                         if (idx == 3) // 货物4
                         {
                             _arrivalTimers[id] = -Math.Log(1 - u) / _lambdaArrival4;
-                            _arrivalTimers[id] = Math.Clamp(_arrivalTimers[id], 10, 30);
+//                            _arrivalTimers[id] = Math.Clamp(_arrivalTimers[id], 10, 30);
+                            _arrivalTimers[id] = Math.Clamp(_arrivalTimers[id], 1, 3);
                         }
                         else
                         {
                             _arrivalTimers[id] = -Math.Log(1 - u) / _lambdaArrival;
-                            _arrivalTimers[id] = Math.Clamp(_arrivalTimers[id], 5, 60);
+//                            _arrivalTimers[id] = Math.Clamp(_arrivalTimers[id], 5, 60);
+                            _arrivalTimers[id] = Math.Clamp(_arrivalTimers[id], 1, 6);
                         }
                     }
                 }
-            }, 1000);
+            }, 1000 / _simSpeed);
 
             // ==========================================
             // 逻辑 C：多加工站独立加工逻辑 (5.0: 支持货物转换)
@@ -640,8 +643,10 @@ namespace ProfControl
                         double u = _rand.NextDouble();
                         bool isRoughStation2 = _roughProcessStations.Contains(id);
                         double usedLambda = isRoughStation2 ? _lambdaRoughProcess : _lambdaFineProcess;
-                        double clampMin = isRoughStation2 ? 30 : 60;  // 粗加工机器加工时间限制在[30, 300]，精加工机器加工时间限制在[60, 500]
-                        double clampMax = isRoughStation2 ? 300 : 500;
+//                        double clampMin = isRoughStation2 ? 30 : 60;  // 粗加工机器加工时间限制在[30, 300]，精加工机器加工时间限制在[60, 500]
+//                        double clampMax = isRoughStation2 ? 300 : 500;
+                        double clampMin = isRoughStation2 ? 3 : 6;  // 粗加工机器加工时间限制在[30, 300]，精加工机器加工时间限制在[60, 500]
+                        double clampMax = isRoughStation2 ? 30 : 50;
                         _processTimers[id] = -Math.Log(1 - u) / usedLambda;
                         _processTimers[id] = Math.Clamp(_processTimers[id], clampMin, clampMax);
                     }
@@ -683,7 +688,7 @@ namespace ProfControl
                     string isRough = _roughProcessStations.Contains(id) ? "粗" : "精";
                     sta.SetValue("加工状态", _isProcessingMap[id] ? $"[{isRough}]加工中:{(int)_processTimers[id]}s" : "等待进料");
                 }
-            }, 1000);
+            }, 1000 / _simSpeed);
 
             // ==========================================
             // 逻辑 D：组装站组装逻辑 (5.0)
@@ -713,7 +718,8 @@ namespace ProfControl
                         _isAssemblyMap[id] = true;
                         double u = _rand.NextDouble();
                         _assemblyTimers[id] = -Math.Log(1 - u) / _lambdaAssembly;
-                        _assemblyTimers[id] = Math.Clamp(_assemblyTimers[id], 60, 600);
+//                        _assemblyTimers[id] = Math.Clamp(_assemblyTimers[id], 60, 600);
+                        _assemblyTimers[id] = Math.Clamp(_assemblyTimers[id], 6, 60);
                     }
 
                     if (_isAssemblyMap[id])
@@ -739,9 +745,9 @@ namespace ProfControl
                     string pn = isProduct13 ? "13" : "14";
                     sta.SetValue("加工状态", _isAssemblyMap[id] ? $"[组装{pn}]组装中:{(int)_assemblyTimers[id]}s" : "等待进料");
                 }
-            }, 1000);
+            }, 1000 / _simSpeed);
         }
         
         public void Kill() { }
     }
-}                
+}  

@@ -33,13 +33,18 @@ class FeatureExtractor:
     def parse_state(self, raw_json_state):
         state = raw_json_state if isinstance(raw_json_state, dict) else json.loads(raw_json_state)
         
-        # 1. 宏观库存特征 (200维)
+        # --- 1. 提取全厂宏观库存，并建立快速查询字典 ---
         station_features = []
+        sta_qtys = {} # 方便后续做 Mask 掩码查询
         for sta in state.get("stations", []):
-            station_features.extend([sta["leftQty"] / 10.0, sta["rightQty"] / 10.0])
+            mark = sta["mark"]
+            l_qty = sta["leftQty"]
+            r_qty = sta["rightQty"]
+            sta_qtys[mark] = (l_qty, r_qty)
+            station_features.extend([l_qty / 10.0, r_qty / 10.0])
         station_features = np.array(station_features, dtype=np.float32)
 
-        # 2. 电梯特征 (10维)
+        # --- 2. 提取电梯特征 ---
         elev_features = []
         for side in self.elev_sides:
             elev = state["elevators"][side]
@@ -53,12 +58,11 @@ class FeatureExtractor:
         mask_dict = {}
         all_agv_features = []
 
-        # 3. AGV 局部特征与掩码
+        # --- 3. 提取 AGV 局部特征并生成【智能动作掩码 Action Mask】 ---
         for agv_data in state.get("agvs", []):
             name = agv_data["name"]
             pos_mark = agv_data["position"]
             
-            # 楼层感知与位置索引
             floor_val = int(pos_mark[0]) / 3.0 if pos_mark.isdigit() and len(pos_mark) == 3 else 0.0
             pos_idx = self.sta_to_idx.get(pos_mark, -1) 
             pos_norm = (pos_idx + 1) / (self.num_stations + 1)
@@ -69,17 +73,56 @@ class FeatureExtractor:
             agv_feature = np.array([floor_val, pos_norm, load_val, is_busy], dtype=np.float32)
             all_agv_features.append(agv_feature)
             
-            # 局部观测 = 自身特征(4) + 库存(200) + 电梯(10) = 214维
+            # 拼装局部观测：自身(4) + 全局库存(200) + 电梯(10)
             local_obs = np.concatenate([agv_feature, station_features, elev_features])
             obs_dict[name] = local_obs
             
-            # 动作遮罩 (1个Idle + 100个去站点的动作 = 101维)
+            # ====================================================
+            # ★ 核心业务掩码逻辑 (破除 AGV 盲目探索，极大加速训练)
+            # ====================================================
             action_mask = np.ones(1 + self.num_stations, dtype=np.bool_)
+            
             if is_busy == 1.0:
-                action_mask[1:] = False # 忙碌时强制屏蔽移动指令，只能选 Idle (索引0)
+                # 状态 A：忙碌中，屏蔽所有移动指令，只能选 Idle(索引0)
+                action_mask[1:] = False 
+            else:
+                # 遍历所有 100 个站点的候选动作 (注意 idx 要 +1)
+                for mark, idx in self.sta_to_idx.items():
+                    act_idx = idx + 1
+                    sta_num = int(mark)
+                    l_qty, r_qty = sta_qtys.get(mark, (0, 0))
+
+                    if load_val == 0.0:
+                        # 状态 B：空车载货 -> 意图是去【取货】
+                        # 规则 1：输入站必须有原材料 (leftQty > 0)
+                        if sta_num in self.source_stations and l_qty == 0:
+                            action_mask[act_idx] = False
+                        # 规则 2：加工站和组装站必须有产成品 (rightQty > 0)
+                        elif sta_num in (self.rough_stations + self.fine_stations + self.assembly_stations) and r_qty == 0:
+                            action_mask[act_idx] = False
+                        # 规则 3：绝对不能去输出站取货 (输出站只进不出)
+                        elif sta_num in self.output_stations:
+                            action_mask[act_idx] = False
+                            
+                    else:
+                        # 状态 C：满载送货 -> 意图是去【卸货】
+                        # 规则 1：绝对不能把货往回送到输入机器！
+                        if sta_num in self.source_stations:
+                            action_mask[act_idx] = False
+                        # 规则 2：如果你能让 C# 返回 cargo_type，这里还能精确屏蔽掉不需要当前货物的机器。
+                        # 目前采用基础屏蔽，如果 AGV 瞎送货（例如把原材料送去组装机器），C# 将下发 -2 分使其学会自我纠正。
+
+            # 载货原地发呆也没意义，空车且全厂没货可取时才允许原地待命
+            if load_val > 0.0:
+                action_mask[0] = False 
+                
+            # 安全兜底：如果所有动作都被屏蔽了（全厂没货且AGV空载），强制允许 Idle
+            if not action_mask.any():
+                action_mask[0] = True
+                
             mask_dict[name] = action_mask
 
-        # 4. 全局状态 = 所有AGV(36) + 电梯(10) + 库存(200) = 246维
+        # --- 4. 拼装 Global State ---
         global_state = np.concatenate(all_agv_features + [elev_features, station_features])
         return obs_dict, global_state, mask_dict
 
@@ -95,6 +138,7 @@ class FactoryHttpEnv:
         self.extractor = FeatureExtractor()
         self.agv_names = self.extractor.agv_names
         self.elev_sides = self.extractor.elev_sides
+        self.last_parsed_state = None # 记录最新的状态字典，用于判断需求
 
     def reset(self):
         """通知 C# 重置工厂物理世界，获取初始状态"""
@@ -102,7 +146,8 @@ class FactoryHttpEnv:
         for attempt in range(max_retries):
             try:
                 response = requests.post(self.reset_url, timeout=5).json()
-                obs_dict, global_state, mask_dict = self.extractor.parse_state(response["state"])
+                self.last_parsed_state = response["state"] if isinstance(response["state"], dict) else json.loads(response["state"])
+                obs_dict, global_state, mask_dict = self.extractor.parse_state(self.last_parsed_state)
                 return obs_dict, global_state, mask_dict
             except requests.exceptions.RequestException as e:
                 print(f"[RL Env] 重置请求失败 (尝试 {attempt+1}/{max_retries})... 错误: {e}")
@@ -115,13 +160,12 @@ class FactoryHttpEnv:
         agv_actions: dict, {"Agv-0": action_idx, ...} (范围 0~100)
         elev_actions: dict, {"left": action_idx, ...} (范围 0~3)
         """
-        # 注意：这里的 Key 使用了大写首字母，严格对齐 C# 的 DTO 类
         payload = {
             "Agvs": {},
             "Elevators": {}
         }
         
-        # 1. 组装 AGV 动作 (触发 C# 的智能装卸)
+        # 1. 组装 AGV 动作
         for name, act_idx in agv_actions.items():
             if act_idx == 0:
                 payload["Agvs"][name] = {"Action": "Idle", "Tgt": 0}
@@ -135,6 +179,20 @@ class FactoryHttpEnv:
                 
         # 2. 组装电梯动作 (0=Idle, 1=1F, 2=2F, 3=3F)
         for name, act_idx in elev_actions.items():
+            # ======= 【修改 1】: 需求驱动的动作掩码 (防止电梯空转) =======
+            if self.last_parsed_state is not None:
+                elev_state = self.last_parsed_state["elevators"].get(name, {})
+                has_agv = elev_state.get("has_agv", 0)
+                wait_1f = elev_state.get("wait_1F", 0)
+                wait_2f = elev_state.get("wait_2F", 0)
+                wait_3f = elev_state.get("wait_3F", 0)
+                total_demand = has_agv + wait_1f + wait_2f + wait_3f
+                
+                # 如果轿厢内没车，且各个楼层都没有排队等待的AGV，强制让网络输出的动作归零(Idle)
+                if total_demand == 0:
+                    act_idx = 0
+            # ============================================================
+
             if act_idx == 0:
                 payload["Elevators"][name] = {"Action": "Idle", "TargetFloor": 1}
             else:
@@ -143,9 +201,8 @@ class FactoryHttpEnv:
                     "TargetFloor": int(act_idx)
                 }
 
-        # 3. HTTP 同步阻塞调用 (等待 C# 演进一秒)
+        # 3. HTTP 同步阻塞调用
         try:
-            # timeout 设为 3 秒，防止 C# 发生死锁卡死 Python
             response = requests.post(self.step_url, json=payload, timeout=3).json()
         except requests.exceptions.Timeout:
             print("[RL Env] 警告：C# 物理步进超时。")
@@ -154,66 +211,10 @@ class FactoryHttpEnv:
             print(f"[RL Env] 与环境断开连接: {e}")
             return None, None, None, None, True
             
-        # 4. 解析返回值
-        obs_dict, global_state, mask_dict = self.extractor.parse_state(response["state"])
+        # 4. 解析返回值并更新最新状态
+        self.last_parsed_state = response["state"] if isinstance(response["state"], dict) else json.loads(response["state"])
+        obs_dict, global_state, mask_dict = self.extractor.parse_state(self.last_parsed_state)
         rewards = response["rewards"]
         done = response["done"]
         
         return obs_dict, global_state, rewards, mask_dict, done
-
-# ==========================================
-# 3. 联调测试主程序 (Random Agent)
-# ==========================================
-if __name__ == "__main__":
-    print("🚀 正在初始化与 C# 仿真环境的连接...")
-    env = FactoryHttpEnv()
-    
-    print("⏳ 尝试发送 /rl-reset 重置环境...")
-    try:
-        obs, global_state, masks = env.reset()
-        print("✅ 环境重置成功！")
-        print(f"📊 全局状态向量维度: {global_state.shape} (预期为 246)")
-        print(f"📊 单个 AGV 局部观测维度: {obs['Agv-0'].shape} (预期为 214)")
-    except Exception as e:
-        print(f"❌ 初始化失败，请检查 C# 端报错: {e}")
-        exit()
-
-    print("\n" + "="*40)
-    print("开始执行随机调度测试 (运行 10 步)")
-    print("="*40)
-    
-    for step in range(10):
-        print(f"\n--- 第 {step + 1} 步 ---")
-        
-        # 为每台 AGV 随机选择一个合法的动作
-        agv_actions = {}
-        for agv_name in env.agv_names:
-            valid_action_indices = np.where(masks[agv_name])[0]
-            # 从允许的动作(mask为True)中随机选一个
-            chosen_action = int(np.random.choice(valid_action_indices))
-            agv_actions[agv_name] = chosen_action
-            
-        # 电梯随机动作 (0: 停着, 1,2,3: 去对应楼层)
-        elev_actions = {
-            "left": random.randint(0, 3),
-            "right": random.randint(0, 3)
-        }
-        
-        # 将动作下发给 C# 环境
-        obs, global_state, rewards, masks, done = env.step(agv_actions, elev_actions)
-        
-        if done is True and obs is None:
-            print("❌ 步进超时或网络断开。")
-            break
-            
-        # 打印即时奖励，看看有没有被 C# 拦截或加分
-        print("🎁 本步奖励回传:")
-        for name, r in rewards.items():
-            if r != 0: # 只打印有动作分数的智能体
-                print(f"  {name}: {r} 分")
-                
-        if done:
-            print("🎉 环境报告订单已全部完成！")
-            break
-            
-        time.sleep(0.5) # 稍微放慢一点，方便您观察 C# 地图上的动画
